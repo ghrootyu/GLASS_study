@@ -1,0 +1,146 @@
+"""
+GraphDataset: CSV 파일을 읽어 시간 스냅샷별 그래프 텐서를 반환한다.
+
+반환 항목 (GraphSnapshot namedtuple):
+  x          (N, 8)  노드 피처: score_a/b 현재값, 7일 평균, 7일 추세, x/y 정규화
+  edge_index (2, E)  무방향 간선 인덱스
+  edge_attr  (E, 2)  간선 피처: 거리, 이동량
+  zone_ids   (N,)    노드 → zone 매핑
+  zone_flow  (Z,)    zone별 평균 이동량
+  y          (Z,)    zone 라벨 (0/1)
+  date       str
+"""
+
+from __future__ import annotations
+from collections import namedtuple
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+
+DATA_DIR = Path(__file__).parent.parent / "data"
+HISTORY  = 7   # 히스토리 윈도우 (일)
+
+GraphSnapshot = namedtuple(
+    "GraphSnapshot",
+    ["x", "edge_index", "edge_attr", "zone_ids", "zone_flow", "y", "date"],
+)
+
+
+class GraphDataset(Dataset):
+    """
+    고정된 그래프 위상 위에서 날짜별로 노드 피처와 zone 라벨이 달라지는 Dataset.
+    """
+
+    def __init__(self, data_dir: Path = DATA_DIR, split: str = "train", train_ratio: float = 0.8):
+        super().__init__()
+        nodes_df  = pd.read_csv(data_dir / "nodes.csv")
+        edges_df  = pd.read_csv(data_dir / "edges.csv")
+        scores_df = pd.read_csv(data_dir / "scores.csv",  parse_dates=["date"])
+        labels_df = pd.read_csv(data_dir / "zone_labels.csv", parse_dates=["date"])
+
+        # ── 고정 위상 ─────────────────────────────────────────────────────────
+        self.n_nodes = len(nodes_df)
+        self.n_zones = nodes_df["zone_id"].nunique()
+
+        # 무방향 간선 (src→dst, dst→src)
+        src = edges_df["src"].values
+        dst = edges_df["dst"].values
+        src_full = np.concatenate([src, dst])
+        dst_full = np.concatenate([dst, src])
+        self.edge_index = torch.tensor(np.stack([src_full, dst_full]), dtype=torch.long)
+
+        dist_norm = _normalize(edges_df["distance"].values)
+        flow_norm = edges_df["avg_flow"].values       # 이미 0~1
+        dist_full = np.concatenate([dist_norm, dist_norm])
+        flow_full = np.concatenate([flow_norm, flow_norm])
+        self.edge_attr = torch.tensor(
+            np.column_stack([dist_full, flow_full]), dtype=torch.float
+        )
+
+        self.zone_ids = torch.tensor(nodes_df["zone_id"].values, dtype=torch.long)
+        self.pos      = nodes_df[["x", "y"]].values / 100.0   # 정규화된 좌표
+
+        # zone별 평균 이동량 (라벨 계산 기준과 동일)
+        zone_flow = np.zeros(self.n_zones)
+        for z in range(self.n_zones):
+            mask = (nodes_df["zone_id"].values[src] == z) | (nodes_df["zone_id"].values[dst] == z)
+            zone_flow[z] = flow_norm[mask].mean() if mask.any() else 0.0
+        self.zone_flow = torch.tensor(zone_flow, dtype=torch.float)
+
+        # ── 시계열 피버팅 ─────────────────────────────────────────────────────
+        scores_df["date"] = pd.to_datetime(scores_df["date"])
+        pivot_a = scores_df.pivot(index="date", columns="node_id", values="score_a")
+        pivot_b = scores_df.pivot(index="date", columns="node_id", values="score_b")
+        self.all_dates = sorted(pivot_a.index)
+        self.pivot_a   = pivot_a.values.astype(np.float32)   # (T, N)
+        self.pivot_b   = pivot_b.values.astype(np.float32)
+
+        # zone 라벨 피버팅
+        labels_df["date"] = pd.to_datetime(labels_df["date"])
+        pivot_lbl = labels_df.pivot(index="date", columns="zone_id", values="action_required")
+        self.pivot_lbl = pivot_lbl.values.astype(np.float32)  # (T, Z)
+
+        # HISTORY일 이전까지는 피처 계산 불가 → 유효 인덱스
+        valid_indices = list(range(HISTORY, len(self.all_dates)))
+        n_train = int(len(valid_indices) * train_ratio)
+        if split == "train":
+            self.indices = valid_indices[:n_train]
+        elif split == "val":
+            self.indices = valid_indices[n_train:]
+        else:
+            self.indices = valid_indices
+
+        # OLS 기울기용 상수
+        days = np.arange(HISTORY, dtype=np.float32)
+        days_c = days - days.mean()
+        self._days_c = days_c
+        self._denom  = float((days_c**2).sum())
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, idx: int) -> GraphSnapshot:
+        t = self.indices[idx]
+
+        sA_now = self.pivot_a[t]   # (N,)
+        sB_now = self.pivot_b[t]
+
+        sA_win = self.pivot_a[t - HISTORY:t]  # (H, N)
+        sB_win = self.pivot_b[t - HISTORY:t]
+
+        sA_mean  = sA_win.mean(0)
+        sB_mean  = sB_win.mean(0)
+        sA_trend = (self._days_c[:, None] * (sA_win - sA_mean)).sum(0) / self._denom
+        sB_trend = (self._days_c[:, None] * (sB_win - sB_mean)).sum(0) / self._denom
+
+        node_feat = np.column_stack([
+            sA_now, sB_now,
+            sA_mean, sB_mean,
+            sA_trend.clip(-1, 1), sB_trend.clip(-1, 1),
+            self.pos[:, 0], self.pos[:, 1],
+        ]).astype(np.float32)   # (N, 8)
+
+        return GraphSnapshot(
+            x          = torch.tensor(node_feat,               dtype=torch.float32),
+            edge_index = self.edge_index,
+            edge_attr  = self.edge_attr,
+            zone_ids   = self.zone_ids,
+            zone_flow  = self.zone_flow,
+            y          = torch.tensor(self.pivot_lbl[t].copy(), dtype=torch.float32),
+            date       = str(self.all_dates[t].date()),
+        )
+
+    @property
+    def pos_weight(self) -> torch.Tensor:
+        """학습 셋 양성 비율 역수 → BCEWithLogitsLoss pos_weight."""
+        all_y = np.concatenate([self.pivot_lbl[i] for i in self.indices])
+        r = all_y.mean()
+        return torch.tensor([(1 - r) / (r + 1e-8)], dtype=torch.float)
+
+
+def _normalize(arr: np.ndarray) -> np.ndarray:
+    lo, hi = arr.min(), arr.max()
+    return (arr - lo) / (hi - lo + 1e-8)
