@@ -1,0 +1,307 @@
+"""
+위험 구역 회피 경로 탐색 (Risk-Aware Routing)
+
+GNN 추론 결과(zone 위험 확률)를 바탕으로:
+  - Hard Block : 위험 zone의 노드/간선을 그래프에서 완전 제거
+  - Soft Penalty: 간선 비용에 위험 확률을 가중치로 반영
+
+사용 예:
+    router = RiskAwareRouter(nodes_df, edges_df, zone_ids)
+    router.update_risk(zone_probs)               # GNN 출력 업데이트
+
+    orig  = router.shortest_path(src, dst, mode="none")
+    hard  = router.shortest_path(src, dst, mode="hard")
+    soft  = router.shortest_path(src, dst, mode="soft", alpha=3.0)
+
+    router.plot(src, dst, orig, hard, soft, save_path=...)
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import List, Optional
+
+import numpy as np
+import pandas as pd
+import networkx as nx
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+
+DATA_DIR = Path(__file__).parent.parent / "data"
+OUT_DIR  = Path(__file__).parent.parent / "outputs"
+
+GRID = 4   # 데이터 생성 시와 동일한 그리드 크기
+
+
+class RiskAwareRouter:
+    """
+    GNN 위험도를 반영한 경로 탐색기.
+
+    Parameters
+    ----------
+    nodes_df : zone_id, x, y 컬럼을 가진 DataFrame (index=node_id)
+    edges_df : src, dst, distance, avg_flow 컬럼을 가진 DataFrame
+    threshold: Hard Block 임계값 (zone_prob > threshold → 차단)
+    """
+
+    def __init__(
+        self,
+        nodes_df: pd.DataFrame,
+        edges_df: pd.DataFrame,
+        threshold: float = 0.5,
+    ):
+        self.nodes_df  = nodes_df
+        self.edges_df  = edges_df
+        self.threshold = threshold
+        self.zone_probs: np.ndarray = np.zeros(GRID * GRID)
+
+        self._base_graph = self._build_base_graph()
+
+    # ── 그래프 구성 ───────────────────────────────────────────────────────────
+
+    def _build_base_graph(self) -> nx.Graph:
+        """거리만 가중치로 쓰는 기본 무방향 그래프."""
+        G = nx.Graph()
+        for nid, row in self.nodes_df.iterrows():
+            G.add_node(int(nid), x=row["x"], y=row["y"], zone_id=int(row["zone_id"]))
+        for _, row in self.edges_df.iterrows():
+            G.add_edge(
+                int(row["src"]), int(row["dst"]),
+                distance=float(row["distance"]),
+                avg_flow=float(row["avg_flow"]),
+            )
+        return G
+
+    def update_risk(self, zone_probs: np.ndarray) -> None:
+        """GNN 추론 결과로 위험 확률 갱신."""
+        self.zone_probs = np.array(zone_probs, dtype=np.float32)
+
+    # ── 경로 탐색 ─────────────────────────────────────────────────────────────
+
+    def shortest_path(
+        self,
+        src: int,
+        dst: int,
+        mode: str = "hard",
+        alpha: float = 3.0,
+    ) -> Optional[List[int]]:
+        """
+        Parameters
+        ----------
+        src, dst : 출발/목적 노드 ID
+        mode     : "none" | "hard" | "soft"
+        alpha    : Soft 모드에서 위험 가중치 배율
+
+        Returns
+        -------
+        노드 ID 리스트 or None (경로 없음)
+        """
+        if mode == "none":
+            G = self._base_graph
+            weight = "distance"
+
+        elif mode == "hard":
+            blocked_zones = set(
+                int(z) for z, p in enumerate(self.zone_probs) if p > self.threshold
+            )
+            # 출발/목적지가 차단 존에 있으면 해당 노드는 제거하지 않음
+            keep = {src, dst}
+            remove_nodes = [
+                n for n, d in self._base_graph.nodes(data=True)
+                if d["zone_id"] in blocked_zones and n not in keep
+            ]
+            G = self._base_graph.copy()
+            G.remove_nodes_from(remove_nodes)
+            weight = "distance"
+
+        elif mode == "soft":
+            G = self._base_graph.copy()
+            for u, v, data in G.edges(data=True):
+                z_u = G.nodes[u]["zone_id"]
+                z_v = G.nodes[v]["zone_id"]
+                # 두 노드 중 더 위험한 존 기준
+                risk = max(float(self.zone_probs[z_u]), float(self.zone_probs[z_v]))
+                data["cost"] = data["distance"] * (1 + alpha * risk)
+            weight = "cost"
+
+        else:
+            raise ValueError(f"mode는 'none' | 'hard' | 'soft' 중 하나여야 합니다: {mode}")
+
+        try:
+            return nx.shortest_path(G, src, dst, weight=weight)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            return None
+
+    def path_distance(self, path: List[int]) -> float:
+        """경로의 실제 거리 합산."""
+        if path is None or len(path) < 2:
+            return float("inf")
+        total = 0.0
+        for u, v in zip(path[:-1], path[1:]):
+            total += self._base_graph[u][v]["distance"]
+        return round(total, 2)
+
+    # ── 시각화 ────────────────────────────────────────────────────────────────
+
+    def plot(
+        self,
+        src: int,
+        dst: int,
+        path_orig:  Optional[List[int]],
+        path_hard:  Optional[List[int]],
+        path_soft:  Optional[List[int]],
+        save_path: Path | None = OUT_DIR / "routing_result.png",
+    ) -> None:
+        """
+        3-패널 비교 그림:
+          왼쪽  : 원래 최단 경로 (위험 무시)
+          가운데: Hard Block 우회 경로
+          오른쪽: Soft Penalty 우회 경로
+        """
+        blocked_zones = set(
+            int(z) for z, p in enumerate(self.zone_probs) if p > self.threshold
+        )
+        cell = 100 / GRID
+
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        titles = [
+            f"Original Path (dist={self.path_distance(path_orig):.1f})",
+            f"Hard Block (dist={self.path_distance(path_hard):.1f})"
+            if path_hard else "Hard Block (No Path)",
+            f"Soft Penalty (dist={self.path_distance(path_soft):.1f})",
+        ]
+        paths = [path_orig, path_hard, path_soft]
+
+        for ax, title, path in zip(axes, titles, paths):
+            ax.set_title(title, fontsize=10)
+            ax.set_xlim(0, 100); ax.set_ylim(0, 100)
+            ax.set_xlabel("x"); ax.set_ylabel("y")
+
+            # 존 배경
+            for z in range(GRID * GRID):
+                col_i = z % GRID
+                row_i = z // GRID
+                prob  = float(self.zone_probs[z])
+                if z in blocked_zones:
+                    color, alpha = "#e74c3c", 0.25 + 0.35 * prob
+                else:
+                    color, alpha = "#2ecc71", 0.12
+                rect = patches.Rectangle(
+                    (col_i * cell, row_i * cell), cell, cell,
+                    linewidth=0.8, edgecolor="#aaa",
+                    facecolor=color, alpha=alpha, zorder=1,
+                )
+                ax.add_patch(rect)
+                ax.text(
+                    col_i * cell + cell / 2, row_i * cell + cell / 2,
+                    f"{prob:.2f}", ha="center", va="center",
+                    fontsize=7, color="#333", zorder=2,
+                )
+
+            # 모든 간선 (얇게)
+            for _, row in self.edges_df.iterrows():
+                u, v = int(row["src"]), int(row["dst"])
+                xu = self.nodes_df.loc[u, "x"]; yu = self.nodes_df.loc[u, "y"]
+                xv = self.nodes_df.loc[v, "x"]; yv = self.nodes_df.loc[v, "y"]
+                ax.plot([xu, xv], [yu, yv], color="#999",
+                        lw=0.4 + row["avg_flow"], alpha=0.2, zorder=2)
+
+            # 경로 강조
+            if path and len(path) >= 2:
+                path_x = [self.nodes_df.loc[n, "x"] for n in path]
+                path_y = [self.nodes_df.loc[n, "y"] for n in path]
+                ax.plot(path_x, path_y, color="#2980b9",
+                        lw=3, zorder=5, solid_capstyle="round",
+                        label="경로")
+                # 경유 노드
+                ax.scatter(path_x[1:-1], path_y[1:-1],
+                           color="#2980b9", s=40, zorder=6, label="Waypoint")
+            elif path is None:
+                ax.text(50, 50, "No Path", ha="center", va="center",
+                        fontsize=14, color="red", fontweight="bold", zorder=10)
+
+            # 출발/목적 노드 강조
+            sx = self.nodes_df.loc[src, "x"]; sy = self.nodes_df.loc[src, "y"]
+            dx = self.nodes_df.loc[dst, "x"]; dy = self.nodes_df.loc[dst, "y"]
+            ax.scatter([sx], [sy], color="#27ae60", s=180,
+                       zorder=7, marker="^", label=f"Start ({src})")
+            ax.scatter([dx], [dy], color="#c0392b", s=180,
+                       zorder=7, marker="*", label=f"Goal ({dst})")
+            ax.legend(loc="upper right", fontsize=8)
+
+        plt.suptitle(
+            f"Risk-Aware Routing  |  Start: node {src}  →  Goal: node {dst}",
+            fontsize=12,
+        )
+        plt.tight_layout()
+        if save_path:
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            plt.savefig(save_path, dpi=150)
+            print(f"저장: {save_path}")
+        plt.show()
+
+
+# ── 편의 함수 ─────────────────────────────────────────────────────────────────
+
+def run_routing_demo(
+    model,
+    dataset,
+    src_node: Optional[int] = None,
+    dst_node: Optional[int] = None,
+    alpha: float = 3.0,
+    threshold: float = 0.5,
+    save_path: Path = OUT_DIR / "routing_result.png",
+) -> None:
+    """
+    마지막 검증 스냅샷으로 GNN 추론 후 경로 비교를 수행한다.
+    src_node/dst_node 미지정 시 자동 선택.
+    """
+    import torch
+    from evaluate import _to_np
+
+    nodes_df = pd.read_csv(DATA_DIR / "nodes.csv").set_index("node_id")
+    edges_df = pd.read_csv(DATA_DIR / "edges.csv")
+
+    # GNN 추론
+    snap = dataset[-1]
+    model.eval()
+    with torch.no_grad():
+        zone_probs = _to_np(model(snap))
+
+    print("\n── Zone 위험 확률 ─────────────────────────────────")
+    for z, p in enumerate(zone_probs):
+        flag = " ← 차단" if p > threshold else ""
+        print(f"  zone {z:2d}: {p:.3f}{flag}")
+
+    # 출발/목적 노드 자동 선택
+    # 위험 zone을 가로질러야 하는 쌍을 찾음
+    blocked = set(z for z, p in enumerate(zone_probs) if p > threshold)
+    safe_nodes = nodes_df[~nodes_df["zone_id"].isin(blocked)].index.tolist()
+
+    if src_node is None or dst_node is None:
+        rng = np.random.default_rng(seed=7)
+        if len(safe_nodes) >= 2:
+            chosen = rng.choice(safe_nodes, size=2, replace=False)
+            src_node = src_node or int(chosen[0])
+            dst_node = dst_node or int(chosen[1])
+        else:
+            all_nodes = nodes_df.index.tolist()
+            src_node = src_node or int(rng.choice(all_nodes))
+            dst_node = dst_node or int(rng.choice([n for n in all_nodes if n != src_node]))
+
+    print(f"\n출발 노드: {src_node} (zone {nodes_df.loc[src_node, 'zone_id']})")
+    print(f"목적 노드: {dst_node} (zone {nodes_df.loc[dst_node, 'zone_id']})")
+
+    router = RiskAwareRouter(nodes_df, edges_df, threshold=threshold)
+    router.update_risk(zone_probs)
+
+    path_orig = router.shortest_path(src_node, dst_node, mode="none")
+    path_hard = router.shortest_path(src_node, dst_node, mode="hard")
+    path_soft = router.shortest_path(src_node, dst_node, mode="soft", alpha=alpha)
+
+    print(f"\n원래 경로  : {path_orig}  (dist={router.path_distance(path_orig)})")
+    print(f"Hard Block : {path_hard}  (dist={router.path_distance(path_hard)})")
+    print(f"Soft Penalty: {path_soft}  (dist={router.path_distance(path_soft)})")
+
+    router.plot(src_node, dst_node, path_orig, path_hard, path_soft,
+                save_path=save_path)
