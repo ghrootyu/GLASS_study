@@ -1,0 +1,90 @@
+"""
+CLI 진입점.
+
+사용 예:
+  python main.py                              # 학습 + 평가
+  python main.py --epochs 100 --lr 1e-3
+  python main.py --eval-only                  # 저장된 모델로 평가만
+  python main.py --route                      # 경로 탐색 데모 추가
+  python main.py --route --src 3 --dst 55     # 출발/목적 노드 직접 지정
+  python main.py --no-plot                    # 시각화 생략
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+# src 디렉토리를 경로에 추가 (직접 실행 시)
+sys.path.insert(0, str(Path(__file__).parent))
+
+from dataset import GraphDataset
+from train import train, load_model, CKPT_DIR
+from evaluate import full_report
+from router import run_routing_demo
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Zone-level Risk Decision via GNN")
+    p.add_argument("--epochs",      type=int,   default=200)
+    p.add_argument("--lr",          type=float, default=8e-4)
+    p.add_argument("--hidden",      type=int,   default=64)
+    p.add_argument("--heads",       type=int,   default=4)
+    p.add_argument("--dropout",     type=float, default=0.2)
+    p.add_argument("--train-ratio", type=float, default=0.8)
+    p.add_argument("--threshold",   type=float, default=0.5,
+                   help="분류 임계값 (default: 0.5)")
+    p.add_argument("--eval-only",   action="store_true",
+                   help="학습 없이 저장된 모델로 평가만 수행")
+    p.add_argument("--no-plot",     action="store_true",
+                   help="시각화 생략")
+    p.add_argument("--route",       action="store_true",
+                   help="위험 구역 회피 경로 탐색 데모 실행")
+    p.add_argument("--src",         type=int, default=None,
+                   help="경로 탐색 출발 노드 ID")
+    p.add_argument("--dst",         type=int, default=None,
+                   help="경로 탐색 목적 노드 ID")
+    p.add_argument("--alpha",       type=float, default=3.0,
+                   help="Soft Penalty 위험 가중치 배율 (default: 3.0)")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.eval_only:
+        ckpt_path = CKPT_DIR / "best_model.pt"
+        if not ckpt_path.exists():
+            print(f"체크포인트를 찾을 수 없습니다: {ckpt_path}")
+            print("먼저 학습을 실행하세요 (python main.py)")
+            sys.exit(1)
+        print(f"체크포인트 로드: {ckpt_path}")
+        model = load_model(ckpt_path)
+    else:
+        model = train(
+            epochs     = args.epochs,
+            lr         = args.lr,
+            hidden     = args.hidden,
+            heads      = args.heads,
+            dropout    = args.dropout,
+            train_ratio= args.train_ratio,
+            threshold  = args.threshold,
+        )
+
+    val_ds = GraphDataset(split="val", train_ratio=args.train_ratio)
+
+    if not args.no_plot:
+        full_report(model, val_ds, threshold=args.threshold)
+
+    if args.route:
+        run_routing_demo(
+            model     = model,
+            dataset   = val_ds,
+            src_node  = args.src,
+            dst_node  = args.dst,
+            alpha     = args.alpha,
+            threshold = args.threshold,
+        )
+
+
+if __name__ == "__main__":
+    main()
