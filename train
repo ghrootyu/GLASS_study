@@ -76,7 +76,10 @@ def train(
     train_ds = GraphDataset(split="train", train_ratio=train_ratio)
     val_ds   = GraphDataset(split="val",   train_ratio=train_ratio)
 
-    model     = ZoneRiskGNN(n_zones=train_ds.n_zones, hidden=hidden, heads=heads, dropout=dropout)
+    model     = ZoneRiskGNN(
+        n_zones=train_ds.n_zones, hidden=hidden, heads=heads, dropout=dropout,
+        phys_dim=2, ops_dim=1,
+    )
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.BCEWithLogitsLoss(pos_weight=train_ds.pos_weight)
@@ -109,6 +112,7 @@ def train(
         "hyperparams": dict(
             n_zones=train_ds.n_zones, hidden=hidden,
             heads=heads, dropout=dropout,
+            phys_dim=2, ops_dim=1,
         ),
         "best_val_f1": best_f1,
     }, ckpt_path)
