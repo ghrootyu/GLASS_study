@@ -25,7 +25,17 @@ HISTORY  = 7   # 히스토리 윈도우 (일)
 
 GraphSnapshot = namedtuple(
     "GraphSnapshot",
-    ["x", "edge_index", "edge_attr", "zone_ids", "zone_flow", "y", "date"],
+    [
+        "x",
+        "edge_index",
+        "edge_attr",        # (E, 2) [dist_norm, avg_flow] — router 호환용
+        "edge_phys_attr",   # (E, 2) [dist_norm, avg_degradation] — 물리 채널
+        "edge_ops_attr",    # (E, 1) [avg_flow]                  — 운영 채널
+        "zone_ids",
+        "zone_flow",
+        "y",
+        "date",
+    ],
 )
 
 
@@ -51,6 +61,8 @@ class GraphDataset(Dataset):
         src_full = np.concatenate([src, dst])
         dst_full = np.concatenate([dst, src])
         self.edge_index = torch.tensor(np.stack([src_full, dst_full]), dtype=torch.long)
+        self._edge_src  = src_full.astype(np.intp)   # (E,) numpy — .numpy() 불필요
+        self._edge_dst  = dst_full.astype(np.intp)
 
         dist_norm = _normalize(edges_df["distance"].values)
         flow_norm = edges_df["avg_flow"].values       # 이미 0~1
@@ -59,6 +71,10 @@ class GraphDataset(Dataset):
         self.edge_attr = torch.tensor(
             np.column_stack([dist_full, flow_full]), dtype=torch.float
         )
+        # 운영 채널: avg_flow only — (E, 1)
+        self.edge_ops_attr = torch.tensor(flow_full[:, None], dtype=torch.float)
+        # 물리 채널 기반 거리 (동적 degradation은 __getitem__에서 계산)
+        self._dist_full = dist_full.astype(np.float32)   # (E,)
 
         self.zone_ids = torch.tensor(nodes_df["zone_id"].values, dtype=torch.long)
         self.pos      = nodes_df[["x", "y"]].values / 100.0   # 정규화된 좌표
@@ -123,14 +139,25 @@ class GraphDataset(Dataset):
             self.pos[:, 0], self.pos[:, 1],
         ]).astype(np.float32)   # (N, 8)
 
+        # 동적 물리 채널: 엣지 양 끝 노드의 평균 열화도 (score_a + score_b) / 2
+        phys_score = ((sA_now + sB_now) / 2).astype(np.float32)   # (N,)
+        src_idx = self._edge_src
+        dst_idx = self._edge_dst
+        edge_degradation = (phys_score[src_idx] + phys_score[dst_idx]) / 2  # (E,)
+        edge_phys_attr = torch.tensor(
+            np.column_stack([self._dist_full, edge_degradation]), dtype=torch.float32
+        )  # (E, 2)
+
         return GraphSnapshot(
-            x          = torch.tensor(node_feat,               dtype=torch.float32),
-            edge_index = self.edge_index,
-            edge_attr  = self.edge_attr,
-            zone_ids   = self.zone_ids,
-            zone_flow  = self.zone_flow,
-            y          = torch.tensor(self.pivot_lbl[t].copy(), dtype=torch.float32),
-            date       = str(self.all_dates[t].date()),
+            x              = torch.tensor(node_feat, dtype=torch.float32),
+            edge_index     = self.edge_index,
+            edge_attr      = self.edge_attr,
+            edge_phys_attr = edge_phys_attr,
+            edge_ops_attr  = self.edge_ops_attr,
+            zone_ids       = self.zone_ids,
+            zone_flow      = self.zone_flow,
+            y              = torch.tensor(self.pivot_lbl[t].copy(), dtype=torch.float32),
+            date           = str(self.all_dates[t].date()),
         )
 
     @property
