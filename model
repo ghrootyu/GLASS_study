@@ -1,11 +1,21 @@
 """
-ZoneRiskGNN: 순수 PyTorch 구현 (torch_geometric 불필요)
+ZoneRiskGNN with DualChannelEdgeGATConv (특허 핵심 아키텍처)
 
 구조:
-  EdgeGATConv × 3  (간선 이동량이 attention에 반영)
+  DualChannelEdgeGATConv × 3
+    ├── PhysicalBranch  : 물리 열화 어텐션 α_phys  (진동·마모 프록시)
+    └── OperationalBranch: 운영 부하 어텐션  α_ops   (물동량 기반)
+    Urgency = sigmoid(γ) · α_phys + (1 − sigmoid(γ)) · α_ops
+    γ 는 학습 가능한 스칼라 → 두 채널의 가중치 자동 조정
+
   → Zone Mean Pooling
   → concat zone_flow
-  → MLP → 존별 조치 필요 확률
+  → MLP → 존별 조치 필요 확률 + 존별 긴급도(Urgency Score)
+
+특허 청구항 대응:
+  [Step 1] edge_phys_attr / edge_ops_attr → 멀티모달 에지 피처 임베딩
+  [Step 2] DualChannelEdgeGATConv        → 정비 긴급도(Urgency Score) 산출
+  [Step 3] MaintenanceScheduler (scheduler.py)와 연동 → 스케줄링 의사결정
 """
 
 from __future__ import annotations
@@ -15,97 +25,146 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class EdgeGATConv(nn.Module):
+class _AttentionBranch(nn.Module):
     """
-    GATv2-inspired graph attention layer with edge features.
-
-    각 간선 (u→v)에서:
-      attention_input = W_src·h_u + W_dst·h_v + W_edge·e_uv
-      α_uv = softmax_v( LeakyReLU(attention_input) · a )
-      h_v' = Σ_u α_uv · W_msg·h_u
+    단일 채널 GATv2 어텐션.
+    edge_attr 종류(물리/운영)에 따라 독립적으로 인스턴스화된다.
     """
 
-    def __init__(self, in_ch: int, out_ch: int, edge_dim: int, heads: int = 4, dropout: float = 0.1):
+    def __init__(self, in_ch: int, out_ch: int, edge_dim: int, heads: int):
         super().__init__()
-        self.heads   = heads
-        self.out_ch  = out_ch
-        self.dropout = dropout
-
-        self.W_src  = nn.Linear(in_ch,    out_ch * heads, bias=False)
-        self.W_dst  = nn.Linear(in_ch,    out_ch * heads, bias=False)
-        self.W_edge = nn.Linear(edge_dim, out_ch * heads, bias=False)
-        self.attn   = nn.Linear(out_ch * heads, heads,    bias=False)
-        self.W_msg  = nn.Linear(in_ch,    out_ch * heads, bias=False)
-        self.out_proj = nn.Linear(out_ch * heads, out_ch)
-        self.bias   = nn.Parameter(torch.zeros(out_ch))
+        self.heads  = heads
+        self.out_ch = out_ch
+        H = heads
+        self.W_src  = nn.Linear(in_ch,    out_ch * H, bias=False)
+        self.W_dst  = nn.Linear(in_ch,    out_ch * H, bias=False)
+        self.W_edge = nn.Linear(edge_dim, out_ch * H, bias=False)
+        self.attn   = nn.Linear(out_ch * H, H,        bias=False)
 
     def forward(
         self,
-        x: torch.Tensor,           # (N, in_ch)
-        edge_index: torch.Tensor,  # (2, E)
-        edge_attr: torch.Tensor,   # (E, edge_dim)
-    ) -> torch.Tensor:             # (N, out_ch)
-        src, dst = edge_index[0], edge_index[1]
-        N, H, D  = x.shape[0], self.heads, self.out_ch
+        x: torch.Tensor,          # (N, in_ch)
+        src: torch.Tensor,        # (E,)
+        dst: torch.Tensor,        # (E,)
+        edge_attr: torch.Tensor,  # (E, edge_dim)
+        N: int,
+    ) -> torch.Tensor:            # (E, H) — attention weights
+        H = self.heads
+        attn_in = self.W_src(x[src]) + self.W_dst(x[dst]) + self.W_edge(edge_attr)
+        attn_in = F.leaky_relu(attn_in, 0.2)
+        logits  = self.attn(attn_in)   # (E, H)
 
-        # GATv2: attention on combined src + dst + edge
-        attn_in  = self.W_src(x[src]) + self.W_dst(x[dst]) + self.W_edge(edge_attr)  # (E, H*D)
-        attn_in  = F.leaky_relu(attn_in, 0.2)
-        logits   = self.attn(attn_in)  # (E, H)
-
-        # Numerically stable softmax per dst-node per head
+        # numerically stable softmax per dst-node per head
         logits_max = torch.zeros(N, H, device=x.device)
         logits_max.scatter_reduce_(
             0, dst.unsqueeze(1).expand(-1, H), logits,
             reduce="amax", include_self=True,
         )
-        exp   = torch.exp(logits - logits_max[dst])        # (E, H)
+        exp     = torch.exp(logits - logits_max[dst])
         exp_sum = torch.zeros(N, H, device=x.device)
         exp_sum.scatter_add_(0, dst.unsqueeze(1).expand(-1, H), exp)
-        alpha = exp / (exp_sum[dst] + 1e-8)                # (E, H)
-
-        if self.dropout > 0 and self.training:
-            alpha = F.dropout(alpha, p=self.dropout)
-
-        # Message: 소스 노드 변환 × attention
-        msg  = self.W_msg(x[src]).view(-1, H, D)           # (E, H, D)
-        msg  = (msg * alpha.unsqueeze(-1)).reshape(-1, H * D)  # (E, H*D)
-
-        agg  = torch.zeros(N, H * D, device=x.device)
-        agg.scatter_add_(0, dst.unsqueeze(1).expand(-1, H * D), msg)
-
-        return self.out_proj(agg) + self.bias               # (N, out_ch)
+        return exp / (exp_sum[dst] + 1e-8)   # (E, H)
 
 
-class ZoneRiskGNN(nn.Module):
+class DualChannelEdgeGATConv(nn.Module):
     """
-    Zone별 조치 필요 여부 이진 분류기.
+    물리 채널(Physical) + 운영 채널(Operational) 이중 어텐션 레이어.
 
-    forward() 반환값:
-      return_logits=False → sigmoid 확률 (Z,)
-      return_logits=True  → raw logits (Z,)  ← BCEWithLogitsLoss 사용 시
+    각 간선 (u→v)에서:
+      α_phys = PhysicalBranch(h_u, h_v, e_phys)   ← 열화·마모 신호
+      α_ops  = OperationalBranch(h_u, h_v, e_ops)  ← 물동량 신호
+      α      = sigmoid(γ)·α_phys + (1−sigmoid(γ))·α_ops   ← 긴급도 가중합
+      h_v'   = Σ_u α_uv · W_msg · h_u
+
+    edge_urgency (E,): 헤드 평균 α → MaintenanceScheduler 입력으로 사용
     """
 
     def __init__(
         self,
-        in_ch: int    = 8,
-        edge_dim: int = 2,
-        hidden: int   = 64,
-        n_zones: int  = 16,
+        in_ch: int,
+        out_ch: int,
+        phys_dim: int,
+        ops_dim: int,
         heads: int    = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.heads   = heads
+        self.out_ch  = out_ch
+        self.dropout = dropout
+
+        self.phys_branch = _AttentionBranch(in_ch, out_ch, phys_dim, heads)
+        self.ops_branch  = _AttentionBranch(in_ch, out_ch, ops_dim,  heads)
+
+        # 학습 가능한 채널 혼합 스칼라 (logit 형태)
+        self.gamma    = nn.Parameter(torch.zeros(1))
+
+        self.W_msg    = nn.Linear(in_ch,          out_ch * heads, bias=False)
+        self.out_proj = nn.Linear(out_ch * heads, out_ch)
+        self.bias     = nn.Parameter(torch.zeros(out_ch))
+
+    def forward(
+        self,
+        x: torch.Tensor,           # (N, in_ch)
+        edge_index: torch.Tensor,  # (2, E)
+        phys_attr: torch.Tensor,   # (E, phys_dim)
+        ops_attr: torch.Tensor,    # (E, ops_dim)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (h_new (N, out_ch), edge_urgency (E,))"""
+        src, dst = edge_index[0], edge_index[1]
+        N, H, D  = x.shape[0], self.heads, self.out_ch
+
+        α_phys = self.phys_branch(x, src, dst, phys_attr, N)   # (E, H)
+        α_ops  = self.ops_branch( x, src, dst, ops_attr,  N)   # (E, H)
+
+        γ     = torch.sigmoid(self.gamma)
+        alpha = γ * α_phys + (1 - γ) * α_ops                  # (E, H)
+
+        # 헤드 평균 → 간선별 긴급도 스코어
+        edge_urgency = alpha.mean(dim=1)                        # (E,)
+
+        if self.dropout > 0 and self.training:
+            alpha = F.dropout(alpha, p=self.dropout)
+
+        msg = self.W_msg(x[src]).view(-1, H, D)
+        msg = (msg * alpha.unsqueeze(-1)).reshape(-1, H * D)
+
+        agg = torch.zeros(N, H * D, device=x.device)
+        agg.scatter_add_(0, dst.unsqueeze(1).expand(-1, H * D), msg)
+
+        return self.out_proj(agg) + self.bias, edge_urgency
+
+
+class ZoneRiskGNN(nn.Module):
+    """
+    Zone별 이진 분류기 + 긴급도(Urgency Score) 동시 출력.
+
+    forward() 반환:
+      return_urgency=False → zone_prob (Z,)
+      return_urgency=True  → (zone_prob (Z,), zone_urgency (Z,))
+      return_logits=True   → prob 대신 raw logit 반환 (BCEWithLogitsLoss용)
+    """
+
+    def __init__(
+        self,
+        in_ch: int     = 8,
+        phys_dim: int  = 2,
+        ops_dim: int   = 1,
+        hidden: int    = 64,
+        n_zones: int   = 16,
+        heads: int     = 4,
         dropout: float = 0.2,
     ):
         super().__init__()
         self.n_zones = n_zones
 
-        self.conv1 = EdgeGATConv(in_ch,  hidden, edge_dim, heads=heads, dropout=dropout)
-        self.conv2 = EdgeGATConv(hidden, hidden, edge_dim, heads=heads, dropout=dropout)
-        self.conv3 = EdgeGATConv(hidden, 32,     edge_dim, heads=2,     dropout=0.0)
+        self.conv1 = DualChannelEdgeGATConv(in_ch,  hidden, phys_dim, ops_dim, heads=heads, dropout=dropout)
+        self.conv2 = DualChannelEdgeGATConv(hidden, hidden, phys_dim, ops_dim, heads=heads, dropout=dropout)
+        self.conv3 = DualChannelEdgeGATConv(hidden, 32,     phys_dim, ops_dim, heads=2,     dropout=0.0)
 
         self.norm1 = nn.LayerNorm(hidden)
         self.norm2 = nn.LayerNorm(hidden)
 
-        # +1: zone_flow 피처를 이어붙임
         self.classifier = nn.Sequential(
             nn.Linear(32 + 1, 48),
             nn.ReLU(),
@@ -113,14 +172,25 @@ class ZoneRiskGNN(nn.Module):
             nn.Linear(48, 1),
         )
 
-    def forward(self, snapshot, return_logits: bool = False) -> torch.Tensor:
-        x, ei, ea = snapshot.x, snapshot.edge_index, snapshot.edge_attr
-        zone_ids  = snapshot.zone_ids
-        zone_flow = snapshot.zone_flow   # (Z,)
+    def forward(
+        self,
+        snapshot,
+        return_logits: bool  = False,
+        return_urgency: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 
-        h = self.norm1(F.elu(self.conv1(x,  ei, ea)))
-        h = self.norm2(F.elu(self.conv2(h,  ei, ea)))
-        h =                   self.conv3(h,  ei, ea)   # (N, 32)
+        x         = snapshot.x
+        ei        = snapshot.edge_index
+        phys_a    = snapshot.edge_phys_attr
+        ops_a     = snapshot.edge_ops_attr
+        zone_ids  = snapshot.zone_ids
+        zone_flow = snapshot.zone_flow
+
+        h, _   = self.conv1(x,  ei, phys_a, ops_a)
+        h = self.norm1(F.elu(h))
+        h, _   = self.conv2(h,  ei, phys_a, ops_a)
+        h = self.norm2(F.elu(h))
+        h, eu3 = self.conv3(h,  ei, phys_a, ops_a)   # (N, 32), (E,)
 
         # Zone mean pooling
         Z   = self.n_zones
@@ -128,9 +198,20 @@ class ZoneRiskGNN(nn.Module):
         cnt = torch.zeros(Z,             device=h.device)
         ze.scatter_add_(0, zone_ids.unsqueeze(1).expand_as(h), h)
         cnt.scatter_add_(0, zone_ids, torch.ones(h.shape[0], device=h.device))
-        ze = ze / cnt.clamp(min=1).unsqueeze(1)        # (Z, 32)
+        ze = ze / cnt.clamp(min=1).unsqueeze(1)          # (Z, 32)
 
-        ze = torch.cat([ze, zone_flow.unsqueeze(1).to(h.device)], dim=1)  # (Z, 33)
+        ze_full = torch.cat([ze, zone_flow.unsqueeze(1).to(h.device)], dim=1)  # (Z, 33)
+        logits  = self.classifier(ze_full).squeeze(-1)   # (Z,)
+        out     = logits if return_logits else torch.sigmoid(logits)
 
-        logits = self.classifier(ze).squeeze(-1)       # (Z,)
-        return logits if return_logits else torch.sigmoid(logits)
+        if return_urgency:
+            # 마지막 레이어의 간선 긴급도를 존 단위로 집계
+            src_z = zone_ids[ei[0]]                      # 출발 노드의 존 ID (E,)
+            zone_urgency = torch.zeros(Z, device=h.device)
+            zone_cnt     = torch.zeros(Z, device=h.device)
+            zone_urgency.scatter_add_(0, src_z, eu3)
+            zone_cnt.scatter_add_(0, src_z, torch.ones(eu3.shape[0], device=h.device))
+            zone_urgency = zone_urgency / zone_cnt.clamp(min=1)   # (Z,)
+            return out, zone_urgency
+
+        return out
