@@ -1,0 +1,595 @@
+# GNN 기반 예방 정비 시스템 — 개념 학습 노트
+
+> 1~3번 완료 후 작성. 4번부터 이어서 학습할 것.
+
+---
+
+## 0. GNN 이란 무엇인가 (배경 지식)
+
+### 0-1. 일반 신경망 vs GNN
+
+일반 신경망(MLP, CNN)은 데이터가 **격자(grid) 또는 순서(sequence)** 형태일 때 잘 동작한다.
+
+```
+MLP : 입력 → 은닉층 → 출력  (순서 없는 벡터)
+CNN : 이미지처럼 격자 구조 (픽셀 간 거리가 의미 있음)
+RNN : 문장처럼 순서가 있는 데이터
+```
+
+그런데 그래프 데이터는 이 중 어느 것도 아니다.
+
+```
+공장 레일 지도:
+  - 노드 수가 고정되어 있지 않음
+  - 각 노드마다 이웃의 수가 다름
+  - 순서도 없고 격자도 아님
+
+→ 기존 신경망을 그대로 적용할 수 없음
+→ GNN(Graph Neural Network)이 필요한 이유
+```
+
+---
+
+### 0-2. GNN의 핵심 아이디어 — "주변을 보고 나를 업데이트"
+
+GNN의 직관은 단순하다.
+
+```
+"어떤 노드의 상태는 자기 자신뿐만 아니라
+ 주변 이웃 노드들의 상태에도 영향을 받는다"
+```
+
+현실 예시:
+```
+레일 교차점 A가 있을 때:
+  A 자신의 센서값은 정상이더라도
+  바로 옆 구간 B가 심각하게 마모되어 있다면
+  → A도 곧 위험해질 가능성이 높다
+
+GNN은 이 "주변 맥락"을 수치로 반영한다.
+```
+
+---
+
+### 0-3. 메시지(Message)란?
+
+**메시지 = 이웃 노드가 나에게 전달하는 정보**
+
+```
+노드 B가 노드 A에게 보내는 메시지:
+  "나(B)의 현재 상태는 이렇습니다" → 벡터 형태로 전달
+
+노드 A 입장:
+  이웃 B, C, D로부터 메시지를 받음
+  → 세 메시지를 합산(집계)
+  → 자신의 임베딩을 업데이트
+```
+
+코드에서 메시지는 이렇게 만들어진다:
+
+```python
+msg = self.W_msg(x[src])
+#     ↑ 출발 노드(src)의 피처를 선형변환한 것이 "메시지"
+#     W_msg: 어떤 정보를 메시지로 보낼지 학습하는 가중치 행렬
+```
+
+---
+
+### 0-4. 메시지 패싱 3단계
+
+GNN의 한 레이어는 항상 이 3단계로 동작한다.
+
+```
+[1단계] Message (생성)
+  각 엣지(u→v)마다 메시지를 만든다
+  msg(u→v) = W_msg · h_u
+  "출발 노드 u의 정보를 변환해서 메시지로 만듦"
+
+[2단계] Aggregate (집계)
+  도착 노드 v가 받은 모든 메시지를 합산한다
+  agg_v = Σ_u msg(u→v)
+  "이웃들이 보낸 메시지를 모두 더함"
+
+[3단계] Update (업데이트)
+  집계된 메시지로 노드의 임베딩을 업데이트한다
+  h_v' = Update(h_v, agg_v)
+  "내 기존 상태 + 이웃들의 정보 → 새로운 상태"
+```
+
+구체적인 예시:
+```
+레이어 통과 전:
+  h_A = [0.5, 0.3]  ← A 자신의 피처만 담긴 벡터
+
+메시지 생성:
+  msg(B→A) = W · h_B = [1.1, 0.9]
+  msg(C→A) = W · h_C = [0.2, 0.1]
+  msg(D→A) = W · h_D = [0.5, 0.6]
+
+집계:
+  agg_A = [1.1+0.2+0.5, 0.9+0.1+0.6] = [1.8, 1.6]
+  (GAT에서는 단순 합이 아닌 attention 가중합)
+
+업데이트:
+  h_A' = [0.876, 0.742]  ← A + 이웃 B, C, D의 정보가 녹아든 벡터
+
+레이어를 3번 통과하면:
+  1번째: 직접 이웃(1-hop)의 정보 흡수
+  2번째: 이웃의 이웃(2-hop)까지 흡수
+  3번째: 3-hop 범위까지 흡수
+  → 멀리 있는 노드의 맥락도 반영됨
+```
+
+---
+
+### 0-5. 임베딩(Embedding)이란?
+
+```
+임베딩 = 노드의 상태를 숫자 벡터로 표현한 것
+
+처음(입력):  h_A = [score_a, score_b, mean_a, mean_b, trend_a, trend_b, x, y]
+             ↑ 사람이 설계한 피처 (8차원)
+
+레이어 통과: h_A = [0.5, 0.3, 0.8, ...]
+             ↑ GNN이 자동으로 학습한 표현 (64차원)
+             ↑ 이웃 정보가 녹아들어 있음
+
+최종 출력:   h_A = [0.876, 0.742, ...]
+             ↑ 분류에 유용한 표현으로 압축됨
+```
+
+차원이 늘어나는 이유:
+```
+입력 8차원 → 은닉 64차원 → 은닉 64차원 → 출력 32차원
+
+더 높은 차원 = 더 많은 패턴을 표현 가능
+최종적으로 줄이는 이유 = 분류에 필요한 핵심 정보만 남기기 위해
+```
+
+---
+
+### 0-6. GNN 레이어를 여러 번 쌓는 이유
+
+```
+레이어 1개: 직접 연결된 이웃(1-hop)만 본다
+레이어 2개: 이웃의 이웃(2-hop)까지 본다
+레이어 3개: 3-hop 범위까지 본다
+
+이 코드에서 conv1, conv2, conv3 총 3개의 레이어를 쌓는 이유:
+  공장 레일 네트워크에서 3구간 떨어진 곳의 상태까지 반영하기 위해
+```
+
+---
+
+## 4. GNN 메시지 패싱 프레임워크
+
+### 4-1. Scatter 연산
+
+GNN에서 이웃 노드 수가 노드마다 다르기 때문에, 단순 행렬 연산으로 집계할 수 없다.
+Scatter 연산은 이 문제를 배치 연산으로 해결한다.
+
+**문제 상황:**
+```
+노드 A의 이웃: B, C, D  (3개)
+노드 E의 이웃: F        (1개)
+
+→ 루프 없이 한 번에 집계하려면?
+```
+
+**scatter_add_ 동작 원리:**
+```
+dst    = [0, 0, 0, 1]      ← 각 메시지가 향하는 노드 인덱스 (A=0, E=1)
+msg    = [[m_B],            ← B가 A에게 보내는 메시지
+          [m_C],            ← C가 A에게 보내는 메시지
+          [m_D],            ← D가 A에게 보내는 메시지
+          [m_F]]            ← F가 E에게 보내는 메시지
+
+결과:
+  agg[0] = m_B + m_C + m_D   ← 노드 A의 집계값
+  agg[1] = m_F               ← 노드 E의 집계값
+```
+
+**코드에서:**
+```python
+agg = torch.zeros(N, H * D, device=x.device)
+agg.scatter_add_(0, dst.unsqueeze(1).expand(-1, H * D), msg)
+# dst: 각 메시지가 향하는 노드 인덱스
+# msg: 실제 메시지 값
+# → 같은 dst를 가진 메시지들이 모두 더해짐
+```
+
+**scatter_reduce_("amax"):**
+```python
+# softmax 수치 안정화를 위한 최댓값 계산에 사용
+logits_max.scatter_reduce_(0, dst, logits, reduce="amax", include_self=True)
+# → 각 dst 노드 기준으로 logits의 최댓값을 구함
+```
+
+---
+
+### 4-2. Zone Mean Pooling
+
+**왜 필요한가:**
+```
+노드 수: 64개
+존  수: 16개  ← 최종 분류 단위
+
+GNN은 노드 임베딩 (64, 32)을 출력
+분류기는 존 임베딩 (16, 32)이 필요
+
+→ 존에 속한 노드들의 임베딩을 평균냄
+```
+
+**동작:**
+```
+존 0에 속한 노드: 2, 5, 9, 14  (4개)
+존 1에 속한 노드: 1, 7, 11     (3개)
+
+zone_emb[0] = (h_2 + h_5 + h_9 + h_14) / 4
+zone_emb[1] = (h_1 + h_7 + h_11) / 3
+```
+
+**코드에서:**
+```python
+ze  = torch.zeros(Z, h.shape[1], device=h.device)   # (16, 32)
+cnt = torch.zeros(Z, device=h.device)               # (16,)
+ze.scatter_add_(0, zone_ids.unsqueeze(1).expand_as(h), h)  # 합산
+cnt.scatter_add_(0, zone_ids, torch.ones(...))              # 개수
+ze = ze / cnt.clamp(min=1).unsqueeze(1)                     # 평균
+```
+
+**zone_flow concat:**
+```python
+# 존별 평균 물동량을 임베딩에 추가로 붙임
+ze_full = torch.cat([ze, zone_flow.unsqueeze(1)], dim=1)  # (16, 33)
+# 왜? GNN이 포착하지 못한 전역 물동량 정보를 분류기에 직접 전달
+```
+
+---
+
+### 4-3. LayerNorm + ELU
+
+**LayerNorm:**
+```
+각 노드의 임베딩 벡터를 정규화 (평균=0, 분산=1)
+→ 레이어가 깊어질수록 값이 폭발하거나 소실되는 것을 방지
+→ BatchNorm과 달리 배치 크기에 무관 (GNN에서는 그래프 크기가 배치)
+```
+
+**ELU (Exponential Linear Unit):**
+```
+x > 0: ELU(x) = x        ← ReLU와 동일
+x ≤ 0: ELU(x) = e^x - 1  ← ReLU와 달리 음수 출력 가능
+
+ReLU 문제: 음수 입력에서 기울기=0 → 뉴런이 죽음(dying ReLU)
+ELU 해결:  음수에서도 부드러운 기울기 → 학습 안정성 향상
+```
+
+**코드에서:**
+```python
+h = self.norm1(F.elu(self.conv1(x, ei, phys_a, ops_a)[0]))
+#              ↑ELU  ↑norm1(LayerNorm)
+# conv3(마지막 레이어)에는 적용 안 함 → 분류기 입력을 제한하지 않기 위해
+```
+
+---
+
+## 5. 시계열 피처 엔지니어링
+
+### 5-1. 슬라이딩 윈도우 (HISTORY=7)
+
+```
+현재 시점 t에서 노드 피처 8개를 구성:
+
+score_a_now    : 현재 센서A 값
+score_b_now    : 현재 센서B 값
+score_a_mean   : 최근 7일 평균 → 중기 상태
+score_b_mean   : 최근 7일 평균
+score_a_trend  : 최근 7일 기울기 → 악화 중인지 회복 중인지
+score_b_trend  : 최근 7일 기울기
+x              : 노드 x 좌표 (정규화)
+y              : 노드 y 좌표 (정규화)
+```
+
+현재값만 쓰면 "지금 나쁜지"만 알고, 평균+추세를 추가하면 "나빠지고 있는지"까지 판단 가능.
+
+---
+
+### 5-2. OLS 기울기 (추세 계산)
+
+최근 7일 센서값의 선형 회귀 기울기를 추세로 사용한다.
+
+```
+수식: trend = Σ(t - t̄)(s - s̄) / Σ(t - t̄)²
+
+예시:
+  7일간 score_a = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  → trend = +0.1  (양수: 악화 중)
+
+  7일간 score_a = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3]
+  → trend = -0.1  (음수: 회복 중)
+```
+
+**코드에서:**
+```python
+days   = np.arange(HISTORY)          # [0,1,2,3,4,5,6]
+days_c = days - days.mean()          # [-3,-2,-1,0,1,2,3]  중앙화
+denom  = (days_c**2).sum()           # 분모 (고정값)
+
+sA_trend = (days_c[:, None] * (sA_win - sA_mean)).sum(0) / denom
+# .clip(-1, 1) 로 이상치 제한
+```
+
+---
+
+### 5-3. 동적 엣지 피처
+
+```
+엣지 피처는 두 종류:
+  정적: avg_flow (거리, 평균 물동량) → 데이터셋 초기화 시 1회 계산
+  동적: edge_phys_attr              → 스냅샷마다 재계산
+
+동적으로 계산하는 이유:
+  엣지 양 끝 노드의 열화도는 날마다 변함
+  → 오늘의 물리적 상태를 매 스냅샷에 반영해야 함
+
+계산 방법:
+  edge_degradation = (phys_score[src] + phys_score[dst]) / 2
+  phys_score[i] = (score_a[i] + score_b[i]) / 2   ← 노드 i의 평균 열화도
+```
+
+---
+
+## 6. 이진 분류 학습
+
+### 6-1. BCEWithLogitsLoss
+
+```
+일반 BCE:
+  loss = -[y·log(σ(x)) + (1-y)·log(1-σ(x))]
+  문제: σ(x) 먼저 계산 → x가 크면 수치 불안정
+
+BCEWithLogitsLoss:
+  sigmoid + BCE를 수학적으로 합쳐서 계산
+  → 수치 안정적 (log-sum-exp 트릭 사용)
+  → 코드: nn.BCEWithLogitsLoss()
+```
+
+**사용 시 주의:**
+```
+모델 출력: logit (sigmoid 적용 전 raw 값)
+           → return_logits=True 로 호출해야 함
+추론 시:   sigmoid 적용 후 확률로 변환
+           → return_logits=False (기본값)
+```
+
+---
+
+### 6-2. pos_weight (클래스 불균형 처리)
+
+```
+데이터 현실:
+  정상 존 (label=0): 80%
+  위험 존 (label=1): 20%  ← 훨씬 적음
+
+문제:
+  모델이 항상 0을 예측해도 정확도 80% → 위험 존을 무시하게 됨
+
+해결:
+  pos_weight = (정상 비율) / (위험 비율) = 0.8 / 0.2 = 4.0
+  → 위험 존을 맞추면 4배 보상
+```
+
+**코드에서:**
+```python
+pos_weight = torch.tensor([(1 - r) / (r + 1e-8)])
+criterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+```
+
+---
+
+### 6-3. Cosine Annealing LR Scheduler
+
+```
+학습률을 고정하면:
+  너무 크면: 최적점을 지나침
+  너무 작으면: 학습이 느림
+
+Cosine Annealing:
+  학습률을 코사인 곡선으로 감소시킴
+  초반: 큰 학습률 → 빠른 탐색
+  후반: 작은 학습률 → 세밀한 수렴
+
+  epoch 1   → lr = 8e-4  (최대)
+  epoch 100 → lr = 4e-4  (중간)
+  epoch 200 → lr = 0     (최소)
+```
+
+---
+
+### 6-4. Gradient Clipping
+
+```
+문제: 역전파 시 기울기가 폭발적으로 커지는 경우 발생
+      → 가중치가 한 번에 너무 많이 변함 → 학습 발산
+
+해결:
+  기울기의 L2 norm이 max_norm=1.0을 넘으면 잘라냄
+  → 방향은 유지, 크기만 제한
+
+코드:
+  nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+  → optimizer.step() 직전에 호출
+```
+
+---
+
+## 7. 최단 경로 알고리즘
+
+### 7-1. Dijkstra (NetworkX)
+
+```
+목표: 시작 노드에서 목적 노드까지 비용이 최소인 경로 탐색
+
+동작:
+  1. 시작 노드 비용 = 0, 나머지 = ∞
+  2. 현재 비용이 가장 작은 노드 선택
+  3. 이웃 노드의 비용 업데이트
+  4. 목적 노드 도달까지 반복
+
+코드:
+  nx.shortest_path(G, src, dst, weight="distance")
+  nx.shortest_path(G, src, dst, weight="cost")     ← 위험도 반영 비용
+```
+
+---
+
+### 7-2. Hard Block vs Soft Penalty
+
+```
+Hard Block:
+  위험 존의 노드를 그래프에서 완전 제거
+  → 해당 구역 절대 통과 불가
+  → 우회 경로가 없으면 None 반환
+
+  사용 시점: 정비 중인 구역, 즉시 차단 필요
+
+Soft Penalty:
+  위험 존의 엣지 비용을 높임
+  cost = distance × (1 + α × risk)
+  → 위험 구역을 가급적 피하되, 다른 방법이 없으면 통과 가능
+
+  사용 시점: 위험도가 높지만 완전 차단은 과도한 경우
+```
+
+**예시:**
+```
+α = 3.0, risk = 0.8 인 구간:
+  원래 거리: 10.0
+  페널티 적용: 10.0 × (1 + 3.0 × 0.8) = 10.0 × 3.4 = 34.0
+  → 34짜리 경로로 취급 → 다른 우회로가 30 이하면 우회
+```
+
+---
+
+### 7-3. 사전 우회 (Proactive Rerouting)
+
+```
+기존 방식 (reactive):
+  정비 시작 → 구역 차단 → OHT가 막힘 → 그때 우회 경로 탐색
+  문제: 이미 막힌 상황에서 병목 발생
+
+이 코드 방식 (proactive):
+  정비 예약 → 정비 시작 전 → 해당 구역 지날 OHT에 미리 우회 명령
+  효과: 병목 사전 차단, 처리량(Throughput) 저하 최소화
+
+코드:
+  router.plan_maintenance_bypass(schedule, active_ohts)
+  → 정비 예정 존을 소프트 페널티로 처리
+  → 현재 운행 중인 모든 OHT의 우회 경로 사전 계산
+```
+
+---
+
+## 8. 예방 정비 스케줄링 이론
+
+### 8-1. Urgency Score의 의미
+
+```
+zone_urgency (Z,): DualChannelEdgeGATConv 마지막 레이어의 edge_urgency를
+                   존 단위로 집계한 값
+
+해석:
+  urgency 높음 = 물리적으로 열화가 심하면서 + 물동량도 많은 구간
+  urgency 낮음 = 열화도 낮거나 물동량이 적은 구간
+
+왜 곱이 아닌 가중합인가:
+  곱(×): 둘 중 하나가 0이면 urgency=0 → 한쪽 신호를 무시
+  합(+): 둘 중 하나라도 높으면 urgency 상승 → 더 보수적인 판단
+```
+
+---
+
+### 8-2. Sliding-window 최소 유량 창 탐색
+
+```
+목표: 정비 소요 시간(duration) 동안 물동량이 가장 적은 시간대 찾기
+
+예시: duration=2, 24시간 물동량 패턴
+  시간:  00 01 02 03 04 05 06 07 ...
+  유량:  0.3 0.2 0.1 0.1 0.2 0.5 0.8 1.0 ...
+
+  window [00-01]: 0.3 + 0.2 = 0.5
+  window [01-02]: 0.2 + 0.1 = 0.3
+  window [02-03]: 0.1 + 0.1 = 0.2  ← 최소
+  window [03-04]: 0.1 + 0.2 = 0.3
+  ...
+
+  → 02:00 시작이 최적 정비 시간대
+```
+
+**코드:**
+```python
+for t in range(T - duration + 1):
+    cost = sum(flow[t : t + duration])
+    if cost < min_cost:
+        min_cost  = cost
+        best_slot = t
+```
+
+---
+
+### 8-3. 정비 소요 기간 추정
+
+```
+urgency가 높을수록 열화가 심함 → 더 많은 정비 작업 필요
+
+urgency → duration 선형 매핑:
+  urgency = threshold(0.5): duration = min_duration(1)
+  urgency = 1.0:            duration = max_duration(6)
+
+  t = (urgency - threshold) / (1 - threshold)
+  duration = min_duration + t × (max_duration - min_duration)
+
+예시:
+  urgency = 0.75, threshold = 0.5
+  t = (0.75 - 0.5) / 0.5 = 0.5
+  duration = 1 + 0.5 × 5 = 3.5 → 3슬롯
+```
+
+---
+
+### 8-4. 전체 파이프라인 (Step 1~3 연결)
+
+```
+[Step 1] 데이터 수집 & 임베딩
+  노드 피처 (8차원) + 엣지 물리/운영 피처
+       ↓
+[Step 2] DualChannelEdgeGATConv × 3레이어
+  → zone_risk_prob  (Z,)  : 이 존을 지금 정비해야 하는가?
+  → zone_urgency    (Z,)  : 얼마나 급한가?
+       ↓
+[Step 3-1] MaintenanceScheduler.schedule()
+  urgency > threshold 인 존 식별 → 우선순위 정렬
+       ↓
+[Step 3-2] forecast_traffic() + _find_low_traffic_window()
+  물동량 예측 → 최소 유량 시간대 탐색 → 정비 타임슬롯 확정
+       ↓
+[Step 3-3] RiskAwareRouter.plan_maintenance_bypass()
+  정비 예정 구역 소프트 페널티 → 운행 중 OHT 사전 우회 경로 계산
+```
+
+---
+
+## 실행 커맨드 정리
+
+```bash
+# 학습 + 스케줄링 데모
+python src/main.py --epochs 200 --schedule
+
+# 저장된 모델로 스케줄링만
+python src/main.py --eval-only --no-plot --schedule --urgency-threshold 0.4
+
+# 경로 탐색 데모 추가
+python src/main.py --eval-only --route --schedule
+```
